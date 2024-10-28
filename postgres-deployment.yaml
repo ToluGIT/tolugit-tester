@@ -14,11 +14,11 @@ spec:
     spec:
       containers:
       - name: postgres
-        image: {{POSTGRES_IMAGE}}
+        image: postgres:latest
         env:
         - name: POSTGRES_USER
-          value: "admin"
+          value: "admin"  # Ensure this matches the app config
         - name: POSTGRES_PASSWORD
-          value: "password"
+          value: "password"  # Ensure this matches the app config
         ports:
         - containerPort: 5432
