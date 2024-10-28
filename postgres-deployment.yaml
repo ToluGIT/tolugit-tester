@@ -17,8 +17,8 @@ spec:
         image: {{POSTGRES_IMAGE}}
         env:
         - name: POSTGRES_USER
-          value: "admin"
+          value: "{{POSTGRES_USER}}"
         - name: POSTGRES_PASSWORD
-          value: "password"
+          value: "{{POSTGRES_PASSWORD}}"
         ports:
         - containerPort: 5432
