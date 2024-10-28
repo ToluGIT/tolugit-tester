@@ -15,5 +15,12 @@ spec:
       containers:
       - name: my-app
         image: {{APP_IMAGE}}
+        env:
+        - name: DB_HOST
+          value: "db"  # Matches the PostgreSQL service name
+        - name: DB_USER
+          value: "admin"  # Matches POSTGRES_USER
+        - name: DB_PASSWORD
+          value: "password"  # Matches POSTGRES_PASSWORD
         ports:
         - containerPort: 3000
