@@ -19,8 +19,8 @@ spec:
         - name: DB_HOST
           value: "db"  # Matches the PostgreSQL service name
         - name: DB_USER
-          value: "admin"  # Matches POSTGRES_USER
+          value: "{{DB_USER}}"  # Matches POSTGRES_USER
         - name: DB_PASSWORD
-          value: "password"  # Matches POSTGRES_PASSWORD
+          value: "{{DB_PASSWORD}}"  # Matches POSTGRES_PASSWORD
         ports:
         - containerPort: 3000
