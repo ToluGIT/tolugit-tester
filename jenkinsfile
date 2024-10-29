@@ -1,0 +1,189 @@
+pipeline {
+    agent any
+
+    environment {
+        SERVER_IP = credentials('prod-server')   // SSH credentials for EC2 instance
+        DOCKER_USR = credentials('dockerusr')    // Docker Hub username
+        DOCKER_PWD = credentials('dockerpwd')    // Docker Hub password
+        AWS_REGION = 'us-east-1'                 // AWS region where the secret is stored
+        SECRET_NAME = 'postgres-credentials'     // Name of the AWS secret
+        APP_IMAGE = "${DOCKER_USR}/nodejs:latest"
+        POSTGRES_IMAGE = "${DOCKER_USR}/postgres:latest"
+        MAILCATCHER_IMAGE = "${DOCKER_USR}/mailcatcher:latest"
+        APP_URL = 'http://localhost:3000'        // Forwarded Minikube app on localhost
+    }
+
+    stages {
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main', url: 'https://github.com/ToluGIT/tolugit-tester.git'
+            }
+        }
+
+        stage('Retrieve Secrets from AWS Secrets Manager') {
+            steps {
+                script {
+                    def secretJson = sh(
+                        script: """
+                        aws secretsmanager get-secret-value \
+                        --secret-id ${SECRET_NAME} \
+                        --region ${AWS_REGION} \
+                        --query SecretString \
+                        --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    def secret = readJSON text: secretJson
+                    env.POSTGRES_USER = secret.POSTGRES_USER
+                    env.POSTGRES_PASSWORD = secret.POSTGRES_PASSWORD
+                    env.DB_USER = secret.DB_USER
+                    env.DB_PASSWORD = secret.DB_PASSWORD
+                }
+            }
+        }
+
+        stage('SonarCloud SAST Analysis') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'SONAR_TOKEN', variable: 'SONAR_TOKEN'),
+                    string(credentialsId: 'SONAR_PROJECT_KEY', variable: 'SONAR_PROJECT_KEY'),
+                    string(credentialsId: 'SONAR_ORGANIZATION', variable: 'SONAR_ORGANIZATION')
+                ]) {
+                    withEnv(["PATH=/usr/local/sonar-scanner/bin:$PATH"]) {
+                        sh '''
+                        sonar-scanner \
+                          -Dsonar.organization=${SONAR_ORGANIZATION} \
+                          -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                          -Dsonar.sources=. \
+                          -Dsonar.host.url=https://sonarcloud.io \
+                          -Dsonar.login=${SONAR_TOKEN}
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Build Server and Client') {
+            steps {
+                sh '''
+                npm ci && npm run build
+                npm ci --prefix client && npm run build --prefix client
+                '''
+            }
+        }
+
+        stage('Tag and Push Docker Images to Docker Hub') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'dockerusr', variable: 'DOCKER_USR'),
+                    string(credentialsId: 'dockerpwd', variable: 'DOCKER_PWD')
+                ]) {
+                    sh '''
+                    echo $DOCKER_PWD | docker login -u $DOCKER_USR --password-stdin
+
+                    docker-compose --file docker-compose.local.yml config --services | while read service; do
+                        image="${DOCKER_USR}/${service}:latest"
+                        image_id=$(docker-compose --file docker-compose.local.yml images --quiet $service)
+
+                        echo "Tagging $image_id as $image..."
+                        docker tag $image_id $image
+
+                        echo "Pushing $image to Docker Hub..."
+                        docker push $image
+                    done
+
+                    docker logout
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Minikube') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'ssh-keygen', 
+                                                   keyFileVariable: 'MY_SSH_KEY', 
+                                                   usernameVariable: 'username')]) {
+                    script {
+                        sh '''
+                        scp -i $MY_SSH_KEY -o StrictHostKeyChecking=no \
+                            app-deployment.yaml postgres-deployment.yaml mailcatcher-deployment.yaml \
+                            app-service.yaml postgres-service.yaml mailcatcher-service.yaml \
+                            ${username}@${SERVER_IP}:/home/ec2-user/
+                        '''
+
+                        sh '''
+                        ssh -i $MY_SSH_KEY -o StrictHostKeyChecking=no ${username}@${SERVER_IP} << EOF
+                        echo "Deploying to Kubernetes on Minikube..."
+
+                        eval $(minikube docker-env)
+
+                        sed -i "s|{{POSTGRES_USER}}|${POSTGRES_USER}|g" /home/ec2-user/postgres-deployment.yaml
+                        sed -i "s|{{POSTGRES_PASSWORD}}|${POSTGRES_PASSWORD}|g" /home/ec2-user/postgres-deployment.yaml
+                        sed -i "s|{{DB_USER}}|${DB_USER}|g" /home/ec2-user/app-deployment.yaml
+                        sed -i "s|{{DB_PASSWORD}}|${DB_PASSWORD}|g" /home/ec2-user/app-deployment.yaml
+
+                        sed -i "s|{{APP_IMAGE}}|${APP_IMAGE}|g" /home/ec2-user/app-deployment.yaml
+                        sed -i "s|{{POSTGRES_IMAGE}}|${POSTGRES_IMAGE}|g" /home/ec2-user/postgres-deployment.yaml
+                        sed -i "s|{{MAILCATCHER_IMAGE}}|${MAILCATCHER_IMAGE}|g" /home/ec2-user/mailcatcher-deployment.yaml
+
+                        kubectl apply -f /home/ec2-user/app-deployment.yaml
+                        kubectl apply -f /home/ec2-user/postgres-deployment.yaml
+                        kubectl apply -f /home/ec2-user/mailcatcher-deployment.yaml
+
+                        kubectl apply -f /home/ec2-user/app-service.yaml
+                        kubectl apply -f /home/ec2-user/postgres-service.yaml
+                        kubectl apply -f /home/ec2-user/mailcatcher-service.yaml
+
+                        '''
+                    }
+                }
+            }
+        }
+
+        // SSH Port Forwarding Stage for OWASP ZAP
+        stage('Setup Port Forwarding for DAST') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'ssh-keygen', 
+                                                   keyFileVariable: 'MY_SSH_KEY', 
+                                                   usernameVariable: 'username')]) {
+                    script {
+                        // Setup SSH Port Forwarding
+                        sh '''
+                        ssh -i $MY_SSH_KEY -L 3000:localhost:3000 ${username}@${SERVER_IP} -N &
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('DAST with OWASP ZAP') {
+            steps {
+                script {
+                    // Run OWASP ZAP scan on the forwarded localhost port
+                    sh '''
+                    docker run --rm -v $(pwd):/zap/wrk:rw -t zaproxy/zap-stable zap-full-scan.py \
+                        -t http://localhost:3000 \
+                        -r zap_report.html
+                    '''
+                }
+            }
+        }
+
+        stage('Publish OWASP ZAP Report') {
+            steps {
+                archiveArtifacts artifacts: 'zap_report.html', allowEmptyArchive: true
+                echo 'OWASP ZAP scan completed. Report archived as zap_report.html'
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Pipeline completed successfully!'
+        }
+        failure {
+            echo 'Pipeline failed. Check logs for more details.'
+        }
+    }
+}
