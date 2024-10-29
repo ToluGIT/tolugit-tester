@@ -10,7 +10,6 @@ pipeline {
         APP_IMAGE = "${DOCKER_USR}/nodejs:latest"
         POSTGRES_IMAGE = "${DOCKER_USR}/postgres:latest"
         MAILCATCHER_IMAGE = "${DOCKER_USR}/mailcatcher:latest"
-        APP_URL = 'http://localhost:3000'        // Forwarded Minikube app on localhost
     }
 
     stages {
@@ -73,7 +72,33 @@ pipeline {
             }
         }
 
-        stage('Tag and Push Docker Images to Docker Hub') {
+        // Add Docker Compose Build Stage Here
+        stage('Build Docker Images') {
+            steps {
+                sh '''
+                docker-compose --file docker-compose.local.yml build
+                '''
+            }
+        }
+
+        stage('Trivy Image Scanning') {
+            steps {
+                script {
+                    sh 'mkdir -p trivy-reports'
+
+                    sh '''
+                    docker images --format "{{.Repository}}:{{.Tag}}" | grep "${DOCKER_USR}" | while read image; do
+                        sanitized_image=$(echo "$image" | sed 's|/|_|g')
+                        report_file="trivy-reports/${sanitized_image}_scan.json"
+                        echo "Scanning $image with Trivy and saving to $report_file..."
+                        trivy image --severity HIGH,CRITICAL --format json --output $report_file $image || true
+                    done
+                    '''
+                }
+            }
+        }
+
+        stage('Push Docker Images to Docker Hub') {
             steps {
                 withCredentials([
                     string(credentialsId: 'dockerusr', variable: 'DOCKER_USR'),
@@ -84,11 +109,6 @@ pipeline {
 
                     docker-compose --file docker-compose.local.yml config --services | while read service; do
                         image="${DOCKER_USR}/${service}:latest"
-                        image_id=$(docker-compose --file docker-compose.local.yml images --quiet $service)
-
-                        echo "Tagging $image_id as $image..."
-                        docker tag $image_id $image
-
                         echo "Pushing $image to Docker Hub..."
                         docker push $image
                     done
@@ -135,20 +155,23 @@ pipeline {
                         kubectl apply -f /home/ec2-user/postgres-service.yaml
                         kubectl apply -f /home/ec2-user/mailcatcher-service.yaml
 
+                        kubectl rollout status deployment/app-deployment
+                        kubectl rollout status deployment/postgres-deployment
+                        kubectl rollout status deployment/mailcatcher-deployment
+
+                        EOF
                         '''
                     }
                 }
             }
         }
 
-        // SSH Port Forwarding Stage for OWASP ZAP
         stage('Setup Port Forwarding for DAST') {
             steps {
                 withCredentials([sshUserPrivateKey(credentialsId: 'ssh-keygen', 
                                                    keyFileVariable: 'MY_SSH_KEY', 
                                                    usernameVariable: 'username')]) {
                     script {
-                        // Setup SSH Port Forwarding
                         sh '''
                         ssh -i $MY_SSH_KEY -L 3000:localhost:3000 ${username}@${SERVER_IP} -N &
                         '''
@@ -160,7 +183,6 @@ pipeline {
         stage('DAST with OWASP ZAP') {
             steps {
                 script {
-                    // Run OWASP ZAP scan on the forwarded localhost port
                     sh '''
                     docker run --rm -v $(pwd):/zap/wrk:rw -t zaproxy/zap-stable zap-full-scan.py \
                         -t http://localhost:3000 \
@@ -182,6 +204,7 @@ pipeline {
         success {
             echo 'Pipeline completed successfully!'
         }
+
         failure {
             echo 'Pipeline failed. Check logs for more details.'
         }
